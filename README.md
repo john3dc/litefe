@@ -14,23 +14,15 @@ A minimal terminal text editor for Linux
 Needs only a C compiler + libc:
 
 ```sh
-make                 # or: cc -O2 -Wall -o litefe litefe.c
-./litefe notes.txt
+cc -O2 -Wall -o litefe litefe.c
+chmod +x litefe
 ```
-
-For a tiny static binary (e.g. for a container or rescue system):
-
-```sh
-make small CC=musl-gcc LDFLAGS=-static
-```
-
 
 ### Install (optional)
 
 ```sh
-sudo make install    # -> /usr/local/bin/litefe
+sudo cp litefe /usr/local/bin/
 ```
-
 
 ## Keys
 
