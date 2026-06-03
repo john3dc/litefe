@@ -6,6 +6,8 @@ A minimal terminal text editor for Linux
 - real selection
 - copy / cut / paste, multi-level undo / redo, find, go-to-line
 
+![litefe editing its own README](images/screenshot.png)
+
 
 ## Build
 
