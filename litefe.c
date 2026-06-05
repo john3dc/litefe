@@ -1,21 +1,20 @@
 /*
  * litefe - a minimal terminal text editor.
  *
- * Single file, depends only on libc (no ncurses). Optional mouse support
- * (click to place the cursor, drag to select, wheel to scroll), real
- * selection with copy / cut / paste, multi-level undo / redo, find and
- * goto-line. A coloured header bar, a reverse-video status line, an overlay
- * window for every prompt, and a coloured key bar.
+ * Single file, depends only on libc (no ncurses). Real selection with
+ * copy / cut / paste, multi-level undo / redo, find and goto-line, mouse
+ * support. A coloured header bar, a status line, an overlay window for every
+ * prompt, and a coloured key bar.
  *
  * Build:  cc -O2 -Wall -o litefe litefe.c
- * Keys:   press F1 inside the program.
+ * Keys:   press Ctrl-H inside the program.
  *
  * Shortcuts:
- *   Ctrl-S save   Ctrl-Q quit   Ctrl-G goto line   F1 help
+ *   Ctrl-S save   Ctrl-Q quit   Ctrl-G goto line   Ctrl-H help
  *   Ctrl-C copy   Ctrl-X cut    Ctrl-V paste   Ctrl-A select all
  *   Ctrl-Z undo   Ctrl-Y redo   Ctrl-D dup line   Ctrl-K cut line
- *   Ctrl-F find   Ctrl-N / F3 find next   Ctrl-E encoding view   F2 mouse
- *   Shift+arrows select, Ctrl+Left/Right word jump.
+ *   Ctrl-F find   Ctrl-N / F3 find next   Ctrl-E encoding view
+ *   Ctrl-B mouse mode   Ctrl-T set mark   Shift/Ctrl+arrows select / word jump
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -57,9 +56,10 @@ static int g_utf8 = 1;
 static int g_tabw = DEF_TABW;   /* LITEFE_TAB: display width of a tab */
 static int g_expandtab = 0;     /* LITEFE_EXPANDTAB: insert spaces instead of a tab */
 static int g_crlf = 0;          /* per-file: write CRLF line endings (detected on load) */
-static int g_mouse = 0;         /* LITEFE_MOUSE / F2: grab the mouse for in-app use.
-                                   off (default) lets the terminal own the mouse, so a
-                                   plain right-click shows its native copy/paste menu. */
+static int g_mouse = 0;         /* LITEFE_MOUSE / Ctrl-B: grab the mouse for in-app use;
+                                   off (default) leaves it to the terminal (native menu). */
+static int g_altscreen = 1;     /* LITEFE_ALTSCREEN=0: stay on the normal screen (leave the
+                                   editor text in place on exit, like nano). */
 
 static void leave_tui(void);
 static void render(void);
@@ -274,20 +274,26 @@ static int char_w(const char *p, int avail, int col, int *blen) {
 static void leave_tui(void) {
     if (!g_in_tui) return;
     if (g_have_orig) tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
-    wr("\x1b[?1002l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    wr("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h");   /* incl. rmkx (normal cursor keys) */
+    if (g_altscreen) wr("\x1b[?1049l");
+    else             wr("\r\n");          /* like nano: leave our text in place */
     g_in_tui = 0;
 }
-/* enable/disable in-app mouse reporting (1002 = drag, 1006 = SGR coords).
-   When off, the terminal keeps the mouse, so its native right-click menu and
-   text selection work like in any plain console program. */
+/* In-app: grab the mouse (1002 = drag, 1006 = SGR coords); the wheel arrives as
+   events. Desktop: don't grab, so the terminal's native selection / right-click
+   menu keep working -- wheel-scroll then comes from application-cursor-keys mode
+   (enter_tui), which makes the terminal forward the wheel as Up/Down arrows. */
 static void mouse_set(int on) {
     wr(on ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1002l\x1b[?1006l");
 }
 static void enter_tui(void) {
     if (g_have_orig) tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_raw);
     /* hardware cursor stays hidden; we draw our own block cursor */
-    wr("\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J");
-    if (g_mouse) mouse_set(1);
+    if (g_altscreen) wr("\x1b[?1049h");
+    wr("\x1b[?1h\x1b=");         /* application cursor keys: lets terminals (e.g. macOS
+                                    Terminal.app) forward the mouse wheel as Up/Down arrows */
+    wr("\x1b[?7l\x1b[?25l\x1b[2J");
+    mouse_set(g_mouse);
     g_in_tui = 1;
 }
 static void on_signal(int sig) { leave_tui(); _exit(128 + sig); }
@@ -453,6 +459,8 @@ static struct {
     int   named;
     int   dirty;
     int   sel;               /* selection active */
+    int   mark;              /* mark mode: plain arrows extend the selection
+                                (for terminals that don't send Shift+arrow, e.g. macOS Terminal.app) */
     int   ax, ay;            /* selection anchor */
     char *clip; int cliplen;
     char  find[256];
@@ -658,7 +666,7 @@ static void sel_delete(void) {
         line_insert(L, L->len, E.line[y1].b + x1, E.line[y1].len - x1);
         for (int i = y1; i > y0; i--) doc_remove_line(i);
     }
-    E.cy = y0; E.cx = x0; E.sel = 0;
+    E.cy = y0; E.cx = x0; E.sel = 0; E.mark = 0;
 }
 static void sel_start(int extend) {
     if (extend) { if (!E.sel) { E.sel = 1; E.ax = E.cx; E.ay = E.cy; } }
@@ -899,9 +907,8 @@ static void load_file(const char *path) {
     doc_set_text(b.p ? b.p : "", len);
     free(b.p);
     E.cx = E.cy = 0; E.rowoff = E.coloff = 0; E.dirty = 0;
-    char base[256]; path_base(path, base, sizeof base);
-    msg("\"%s\" %d line%s  [%s, %s]", base, E.nlines, E.nlines == 1 ? "" : "s",
-        g_crlf ? "CRLF" : "LF", enc_name());
+    /* no startup message: the status line already shows the name, line count,
+       line ending and encoding, so a banner here would just be redundant. */
 }
 
 static int overlay_prompt(const char *title, char *buf, size_t bufsz, const char *initial);
@@ -1153,6 +1160,8 @@ static int maybe_discard(const char *what) {
 /* Rendering                                                          */
 /* ------------------------------------------------------------------ */
 static int gutter_w(void) {
+    if (!g_mouse) return 0;        /* desktop-mouse mode: no gutter, so a native
+                                      terminal drag-select doesn't copy line numbers */
     int d = 1, n = E.nlines;
     while (n >= 10) { n /= 10; d++; }
     if (d < 3) d = 3;
@@ -1160,11 +1169,13 @@ static int gutter_w(void) {
 }
 
 static void render_text_row(Buf *out, int ln, int gw, int textw) {
-    /* gutter */
-    int cur = (ln == E.cy);
-    buf_s(out, cur ? C_GUTC : C_GUT);
-    buf_printf(out, "%*d ", gw - 1, ln + 1);
-    buf_s(out, C_RESET);
+    /* gutter (suppressed when gw == 0, i.e. desktop-mouse mode) */
+    if (gw > 0) {
+        int cur = (ln == E.cy);
+        buf_s(out, cur ? C_GUTC : C_GUT);
+        buf_printf(out, "%*d ", gw - 1, ln + 1);
+        buf_s(out, C_RESET);
+    }
 
     Line *l = &E.line[ln];
 
@@ -1249,7 +1260,7 @@ static void render(void) {
         char disp[PATH_MAX];
         abbrev_home(E.named ? E.path : "[No Name]", disp, sizeof disp);
         char head[PATH_MAX + 32];
-        snprintf(head, sizeof head, " litefe  %s%s", disp, E.dirty ? "  *" : "");
+        snprintf(head, sizeof head, " litefe - %s%s", disp, E.dirty ? "  *" : "");
         buf_s(&out, "\x1b[30;46m");
         int used = buf_add_trunc(&out, head, W);
         buf_pad(&out, W - used);
@@ -1263,9 +1274,12 @@ static void render(void) {
         if (ln < E.nlines) {
             render_text_row(&out, ln, gw, textw);
         } else {
-            buf_s(&out, C_GUT);
-            buf_printf(&out, "%*s ", gw - 1, "~");
-            buf_s(&out, C_RESET);
+            if (gw > 0) {                        /* no ~ in desktop mode, so a native
+                                                    drag-select copies clean empty lines */
+                buf_s(&out, C_GUT);
+                buf_printf(&out, "%*s ", gw - 1, "~");
+                buf_s(&out, C_RESET);
+            }
             buf_s(&out, "\x1b[K\r\n");
         }
     }
@@ -1273,19 +1287,20 @@ static void render(void) {
     /* status line */
     {
         Buf S = {0};
+        /* left side: only transient messages (Copied/Saved/...); the file name
+           already lives in the header bar, so don't repeat it here. */
         if (g_msg[0]) { buf_add(&S, " ", 1); buf_s(&S, g_msg); }
-        else {
-            char base[256]; path_base(E.named ? E.path : "untitled", base, sizeof base);
-            buf_printf(&S, " %s%s", base, E.dirty ? " [+]" : "");
-        }
+        else buf_add(&S, " ", 1);
         char right[160];
         snprintf(right, sizeof right, "Ln %d/%d  Col %d  %s  %s ",
                  E.cy + 1, E.nlines, curcol + 1,
                  g_crlf ? "CRLF" : "LF", enc_name());
         char selinfo[48] = "";
-        if (E.sel) { int n; char *t = sel_text(&n); free(t); snprintf(selinfo, sizeof selinfo, "[sel %d] ", n); }
+        if (E.sel) { int n; char *t = sel_text(&n); free(t);
+                     snprintf(selinfo, sizeof selinfo, "%s[sel %d] ", E.mark ? "MARK " : "", n); }
+        else if (E.mark) snprintf(selinfo, sizeof selinfo, "MARK ");
 
-        buf_s(&out, "\x1b[7m");
+        buf_s(&out, "\x1b[30;46m");          /* same colour as the header bar */
         char rfull[220];
         snprintf(rfull, sizeof rfull, "%s%s", selinfo, right);
         int lwid = str_width(S.p ? S.p : "");
@@ -1307,13 +1322,13 @@ static void render(void) {
     {
         static const struct { const char *key, *lab; int act; } KB[] = {
             {"^S","Save",19},{"^F","Find",6},{"^G","Goto",7},
-            {"^Z","Undo",26},{"^Y","Redo",25},{"^C","Copy",3},
-            {"^X","Cut",24},{"^V","Paste",22},{0,0,0}
+            {"^T","Sel",20},{"^B","Mode",2},{"^Z","Undo",26},{"^Y","Redo",25},
+            {"^C","",3},{"^X","",24},{"^V","",22},{"^D","",4},{"^K","",11},{0,0,0}
         };
         const char *bar = "\x1b[1;36m";
         const char *dim = "\x1b[38;5;250m";
         const char *vt  = g_utf8 ? "│" : "|";
-        int rightw = 11;                    /* "│ ^Q Quit" */
+        int rightw = 6;                     /* "│ ^Q" + margin */
         int limit = W - rightw - 1;
         Buf K = {0};
         int col = 1;
@@ -1321,20 +1336,19 @@ static void render(void) {
         buf_s(&K, " ");
         for (int i = 0; KB[i].key; i++) {
             int klen = (int)strlen(KB[i].key), llen = (int)strlen(KB[i].lab);
-            int need = (i ? 3 : 0) + klen + 1 + llen;
+            int w = klen + (llen ? 1 + llen : 0);     /* "^C" alone, or "^S Save" */
+            int need = (i ? 3 : 0) + w;
             if (col + need > limit) break;
             if (i) { buf_s(&K, C_SEP); buf_s(&K, " "); buf_s(&K, vt); buf_s(&K, " "); buf_s(&K, C_RESET); col += 3; }
-            g_kbhit[g_kbhit_n++] = (KbHit){ col + 1, klen + 1 + llen, KB[i].act };  /* screen col = consumed+1 */
+            g_kbhit[g_kbhit_n++] = (KbHit){ col + 1, w, KB[i].act };  /* screen col = consumed+1 */
             buf_s(&K, bar); buf_s(&K, KB[i].key); buf_s(&K, C_RESET);
-            buf_s(&K, " ");
-            buf_s(&K, dim); buf_s(&K, KB[i].lab); buf_s(&K, C_RESET);
-            col += klen + 1 + llen;
+            if (llen) { buf_s(&K, " "); buf_s(&K, dim); buf_s(&K, KB[i].lab); buf_s(&K, C_RESET); }
+            col += w;
         }
         if (W - rightw - col > 0) { buf_pad(&K, W - rightw - col); col = W - rightw; }
         buf_s(&K, C_SEP); buf_s(&K, vt); buf_s(&K, " "); buf_s(&K, C_RESET);
-        g_kbhit[g_kbhit_n++] = (KbHit){ col + 3, 7, 17 };   /* "^Q Quit", after "│ " */
+        g_kbhit[g_kbhit_n++] = (KbHit){ col + 3, 2, 17 };   /* "^Q", after "│ " */
         buf_s(&K, bar); buf_s(&K, "^Q"); buf_s(&K, C_RESET);
-        buf_s(&K, " "); buf_s(&K, dim); buf_s(&K, "Quit"); buf_s(&K, C_RESET);
         buf_add(&out, K.p ? K.p : "", K.len);
         buf_s(&out, "\x1b[K");
         free(K.p);
@@ -1352,7 +1366,7 @@ static void show_help(void) {
         "  litefe  -  minimal text editor",
         "",
         "  Ctrl-S  save            Ctrl-Q  quit",
-        "  Ctrl-G  go to line      F1      this help",
+        "  Ctrl-G  go to line      Ctrl-H  this help",
         "  Ctrl-F  find            Ctrl-N / F3  find next",
         "",
         "  Ctrl-C  copy            Ctrl-X  cut",
@@ -1363,12 +1377,16 @@ static void show_help(void) {
         "  arrows / Home / End / PgUp / PgDn   move",
         "  Shift + arrows / Home / End         select",
         "  Ctrl + Left / Right                 jump word",
+        "  Ctrl-T set mark, then move to select (works",
+        "         when the terminal eats Shift+arrow, e.g.",
+        "         macOS Terminal.app); Esc cancels the mark.",
         "",
-        "  Mouse: off by default, so right-click shows the",
-        "         terminal's own menu and selection is native.",
-        "         F2 toggles in-app mouse (click = place",
-        "         cursor, drag = select, wheel = scroll);",
-        "         then Shift+right-click gives the term menu.",
+        "  Ctrl-B toggles the mouse mode:",
+        "    Desktop (default): the terminal owns the mouse,",
+        "      so native drag-select / right-click menu work;",
+        "      line numbers are hidden so a copy stays clean.",
+        "    In-app: click = place cursor, drag = select,",
+        "      wheel = scroll, line numbers shown.",
         "  No selection: Ctrl-C copies the char under the",
         "         cursor; Ctrl-K cuts the whole line.",
         "  Copy/cut also go to the system clipboard (OSC 52).",
@@ -1456,29 +1474,29 @@ static void dispatch_key(int k) {
         case K_EOF: g_running = 0; break;
         case K_MOUSE: handle_mouse(); break;
 
-        /* navigation */
-        case K_LEFT:   move_left(0);  break;
-        case K_RIGHT:  move_right(0); break;
-        case K_UP:     move_vert(-1, 0); break;
-        case K_DOWN:   move_vert(1, 0);  break;
+        /* navigation — plain arrows extend the selection while mark mode is on */
+        case K_LEFT:   move_left(E.mark);  break;
+        case K_RIGHT:  move_right(E.mark); break;
+        case K_UP:     move_vert(-1, E.mark); break;
+        case K_DOWN:   move_vert(1, E.mark);  break;
         case K_SLEFT:  move_left(1);  break;
         case K_SRIGHT: move_right(1); break;
         case K_SUP:    move_vert(-1, 1); break;
         case K_SDOWN:  move_vert(1, 1);  break;
-        case K_CLEFT:  move_word(-1, 0); break;
-        case K_CRIGHT: move_word(1, 0);  break;
-        case K_CUP:    move_vert(-1, 0); break;
-        case K_CDOWN:  move_vert(1, 0);  break;
-        case K_HOME:   move_home(0);  break;
-        case K_END:    move_end(0);   break;
+        case K_CLEFT:  move_word(-1, E.mark); break;
+        case K_CRIGHT: move_word(1, E.mark);  break;
+        case K_CUP:    move_vert(-1, E.mark); break;
+        case K_CDOWN:  move_vert(1, E.mark);  break;
+        case K_HOME:   move_home(E.mark);  break;
+        case K_END:    move_end(E.mark);   break;
         case K_SHOME:  move_home(1);  break;
         case K_SEND:   move_end(1);   break;
-        case K_PGUP:   { int b = g_rows - 4; for (int i = 0; i < b; i++) move_vert(-1, 0); break; }
-        case K_PGDN:   { int b = g_rows - 4; for (int i = 0; i < b; i++) move_vert(1, 0);  break; }
+        case K_PGUP:   { int b = g_rows - 4; for (int i = 0; i < b; i++) move_vert(-1, E.mark); break; }
+        case K_PGDN:   { int b = g_rows - 4; for (int i = 0; i < b; i++) move_vert(1, E.mark);  break; }
 
         /* editing */
         case K_ENTER: case '\n': ed_newline(); break;
-        case K_BS: case 8: ed_backspace(); break;
+        case K_BS: ed_backspace(); break;          /* 127/DEL; byte 8 (^H) is Help below */
         case K_DEL: ed_delete(); break;
         case K_TAB: ed_insert_tab(); break;
 
@@ -1488,8 +1506,14 @@ static void dispatch_key(int k) {
         case 7:  ed_goto(); break;                 /* ^G */
         case 6:  ed_find(); break;                 /* ^F */
         case 14: case K_F3: ed_find_next(); break; /* ^N / F3 */
-        case 3:  ed_copy(); break;                 /* ^C */
-        case 24: ed_cut(); break;                  /* ^X */
+        case 3:  ed_copy(); E.mark = 0; break;     /* ^C */
+        case 24: ed_cut();  E.mark = 0; break;     /* ^X */
+        case 20:                                   /* ^T = set/clear mark (layout-independent) */
+            if (E.mark || E.sel) { E.mark = 0; E.sel = 0; msg("Mark cleared"); }
+            else { E.mark = 1; E.sel = 1; E.ax = E.cx; E.ay = E.cy;
+                   msg("Mark set — move with arrows to select, Ctrl-C/Ctrl-X, Esc cancels"); }
+            break;
+        case K_ESC: E.mark = 0; E.sel = 0; break;  /* cancel mark / selection */
         case 22: ed_paste(); break;                /* ^V */
         case 1:  ed_select_all(); break;           /* ^A */
         case 26: do_undo(); break;                 /* ^Z */
@@ -1499,12 +1523,10 @@ static void dispatch_key(int k) {
         case 5:  g_enc = (g_enc + 1) % 3; clamp_cursor();   /* ^E cycle encoding view */
                  msg("Encoding view: %s", enc_name()); break;
         case 12: g_resized = 1; break;             /* ^L redraw */
-        case K_F2:                                 /* toggle in-app mouse grab */
+        case 2:                                    /* ^B toggle mouse mode */
             g_mouse = !g_mouse; mouse_set(g_mouse);
-            msg(g_mouse ? "In-app mouse ON (Shift+right-click for terminal menu)"
-                        : "In-app mouse OFF (terminal owns the mouse; right-click = its menu)");
             break;
-        case K_F1: show_help(); break;
+        case 8: show_help(); break;                /* ^H help (Backspace is 127/DEL) */
 
         default:
             if (k >= 32 && k < 256) ed_insert_byte(k);
@@ -1526,6 +1548,8 @@ int main(int argc, char **argv) {
     g_expandtab = xt && xt[0] && strcmp(xt, "0") != 0;
     const char *mo = getenv("LITEFE_MOUSE");                     /* in-app mouse (default off) */
     g_mouse = mo && mo[0] && strcmp(mo, "0") != 0;
+    const char *as = getenv("LITEFE_ALTSCREEN");                 /* 0 = stay on normal screen */
+    if (as && as[0]) g_altscreen = strcmp(as, "0") != 0;
     const char *e = getenv("LITEFE_ENC");                        /* encoding view */
     if (e && e[0]) {
         g_enc_forced = 1;
@@ -1540,11 +1564,11 @@ int main(int argc, char **argv) {
     if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         printf("litefe - minimal terminal text editor\n"
                "usage: litefe [file]\n"
-               "keys:  F1 inside the program. Ctrl-S save, Ctrl-Q quit.\n"
+               "keys:  Ctrl-H inside the program. Ctrl-S save, Ctrl-Q quit.\n"
                "env:   LITEFE_TAB=N (tab width, default 4)\n"
                "       LITEFE_EXPANDTAB=1 (insert spaces instead of a tab)\n"
                "       LITEFE_ENC=utf8|latin1|cp1252 (encoding view; Ctrl-E cycles)\n"
-               "       LITEFE_MOUSE=1 (grab the mouse for in-app use; F2 toggles)\n"
+               "       LITEFE_MOUSE=1 (grab the mouse for in-app use; Ctrl-B toggles)\n"
                "Mouse is off by default so the terminal's own right-click menu works.\n"
                "CRLF/LF line endings are detected on load and preserved.\n");
         return 0;
@@ -1552,7 +1576,7 @@ int main(int argc, char **argv) {
 
     E.goalcol = -1;
     if (argc > 1) load_file(argv[1]);
-    else { doc_set_text("", 0); E.named = 0; E.dirty = 0; msg("New buffer  -  press F1 for help"); }
+    else { doc_set_text("", 0); E.named = 0; E.dirty = 0; msg("New buffer  -  press Ctrl-H for help"); }
 
     if (term_init() < 0) {
         fprintf(stderr, "litefe: not a terminal (needs an interactive tty)\n");

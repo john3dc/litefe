@@ -15,7 +15,6 @@ Needs only a C compiler + libc:
 
 ```sh
 cc -O2 -Wall -o litefe litefe.c
-chmod +x litefe
 ```
 
 ### Install (optional)
@@ -35,7 +34,21 @@ sudo cp litefe /usr/local/bin/
 | `Ctrl-Z` / `Ctrl-Y` | undo / redo |
 | `Ctrl-D` / `Ctrl-K` | duplicate line · cut line |
 | `Shift`+arrows | select · `Ctrl`+`Left`/`Right` word jump |
-| `F1` | help |
-| `F2` | toggle in-app mouse |
+| `Ctrl-T` | set mark, then move to select (for terminals that eat `Shift`+arrow, e.g. macOS Terminal.app); `Esc` cancels |
+| `Ctrl-B` | toggle mouse mode |
+| `Ctrl-H` | help |
 
-Press **`F1`** inside the editor for the full list.
+Press **`Ctrl-H`** inside the editor for the full list.
+
+## Mouse modes
+
+Toggle with **`Ctrl-B`**:
+
+- **Desktop** (default): the terminal owns the mouse, so native
+  drag-select and the right-click menu work and copy plain text. Line
+  numbers are hidden so a selection stays clean, and the mouse wheel
+  scrolls the document.
+- **In-app**: click places the cursor, drag makes an editor selection,
+  the wheel scrolls, and line numbers are shown.
+
+Copy / cut also push to the system clipboard via OSC 52.
